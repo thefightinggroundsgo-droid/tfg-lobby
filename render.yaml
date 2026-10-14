@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: tfg-lobby
+    runtime: go
+    plan: free
+    region: ohio
+    buildCommand: go build -o tfg-lobby .
+    startCommand: ./tfg-lobby
+    healthCheckPath: /health
