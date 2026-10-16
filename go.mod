@@ -1,5 +1,3 @@
-module tfg-lobby
+module tfglobby
 
-go 1.22
-
-require github.com/gorilla/websocket v1.5.3
+go 1.21
