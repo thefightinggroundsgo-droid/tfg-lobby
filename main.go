@@ -36,20 +36,21 @@ import (
 )
 
 const (
-	maxRooms     = 300
-	maxPerIP     = 4
-	maxNameLen   = 20
-	maxFrame     = 256 * 1024
-	maxMembers   = 5
-	pingEvery    = 20 * time.Second
-	readTimeout  = 70 * time.Second
-	writeTimeout = 10 * time.Second
-	roomLifetime = 10 * time.Hour
-	sendQueue    = 4096
-	maxReplay    = 48 << 20
-	maxStake     = 100000
-	resultWait   = 25 * time.Second
-	claimKeep    = 48 * time.Hour
+	maxRooms      = 300
+	maxPerIP      = 4
+	maxNameLen    = 20
+	maxFrame      = 256 * 1024
+	maxMembers    = 8 // DLC Patch 1: 8 (was 5) - with side fights several pairs play at once
+	pingEvery     = 20 * time.Second
+	readTimeout   = 120 * time.Second // the game answers every ping (every 20 s) at once; this only catches a dead line
+	selfPingEvery = 8 * time.Minute   // see keepAwake
+	writeTimeout  = 10 * time.Second
+	roomLifetime  = 10 * time.Hour
+	sendQueue     = 4096
+	maxReplay     = 48 << 20
+	maxStake      = 100000
+	resultWait    = 25 * time.Second
+	claimKeep     = 48 * time.Hour
 
 	tGame   = 0x01
 	tReplay = 0x02
@@ -81,6 +82,14 @@ type member struct {
 	fighter  int // 0 none, 1, 2
 	reported int // -1 nothing yet, else 0/1/2
 	repAt    time.Time
+	// practice (see practice.go)
+	practice  bool        // training alone on their PC
+	spar      *spar       // in a practice match against another member
+	inv       *member     // who asked them for a practice match
+	invRanked bool        // ... and whether it was a ranked side fight
+	invAt     time.Time   // when
+	callT     *time.Timer // running while they are called back for their fight
+	callGen   int
 }
 
 type terms struct {
@@ -241,6 +250,7 @@ type mview struct {
 	L    int    `json:"l"`
 	Bal  int    `json:"bal"`
 	Late bool   `json:"late,omitempty"` // arrived during the running match: can not watch it
+	Pr   int    `json:"pr,omitempty"`   // 1 training alone, 2 in a practice match
 }
 
 func (r *room) fighterIDs() []string {
@@ -265,7 +275,7 @@ func (r *room) fighterIDs() []string {
 func (r *room) snapshot(to *member) []byte {
 	ms := make([]mview, 0, len(r.members))
 	for _, m := range r.members {
-		ms = append(ms, mview{ID: m.id, Name: m.name, RP: m.rp, Pl: m.plate, W: m.wins, L: m.losses, Bal: m.bal, Late: r.phase == "play" && !m.spec && m.fighter == 0})
+		ms = append(ms, mview{ID: m.id, Name: m.name, RP: m.rp, Pl: m.plate, W: m.wins, L: m.losses, Bal: m.bal, Late: r.phase == "play" && !m.spec && m.fighter == 0, Pr: practiceState(m)})
 	}
 	q := make([]string, 0, len(r.queue))
 	for _, m := range r.queue {
@@ -289,6 +299,7 @@ func (r *room) broadcast() {
 	for _, m := range r.members {
 		m.queueFrame(frame{websocket.TextMessage, r.snapshot(m)})
 	}
+	r.checkCall()
 }
 
 func (r *room) find(id string) *member {
@@ -526,6 +537,15 @@ func relayBinary(m *member, b []byte) {
 	mu.Lock()
 	defer mu.Unlock()
 	r := m.room
+	if r != nil && m.spar != nil {
+		// a practice match: the two engines talk to each other, whatever the room is doing
+		if b[0] == tGame {
+			if other := m.spar.other(m); other != nil {
+				other.queueFrame(frame{websocket.BinaryMessage, b})
+			}
+		}
+		return
+	}
 	if r == nil || r.phase != "play" {
 		return
 	}
@@ -564,6 +584,18 @@ func leave(m *member) {
 	if r == nil {
 		return
 	}
+	if sp := m.spar; sp != nil {
+		if sp.ranked {
+			sideSettle(r, sp, m) // leaving during a ranked side fight is a forfeit, like in the line's fight
+		} else {
+			endSpar(sp, m, true)
+		}
+	}
+	if m.callT != nil {
+		m.callT.Stop()
+		m.callT = nil
+	}
+	m.practice, m.inv = false, nil
 	m.room = nil
 	wasFighter := m.fighter
 	if r.phase == "play" && wasFighter != 0 && m.reported < 0 {
@@ -629,6 +661,9 @@ func handle(m *member, op string, msg map[string]any) {
 		m.bal = clampI(int(v), 0, 100000000)
 	}
 	switch op {
+	case "ka":
+		// keep-alive from the game's connector (every 30 s): nothing to do here, arriving is the point. It keeps
+		// the line busy for routers that forget quiet connections and counts as traffic for the host.
 	case "ready":
 		if r.phase != "lobby" || len(r.queue) < 2 {
 			return
@@ -788,6 +823,10 @@ func handle(m *member, op string, msg map[string]any) {
 			m.queueFrame(frame{websocket.BinaryMessage, chunk})
 		}
 	case "result":
+		if sp := m.spar; sp != nil && sp.ranked && str("match") == sp.id {
+			sideReport(r, m, sp, num("winner"))
+			return
+		}
 		if r.phase != "play" || m.fighter == 0 || str("match") != r.matchID {
 			return
 		}
@@ -816,6 +855,8 @@ func handle(m *member, op string, msg map[string]any) {
 			}
 		}
 		claims[m.token] = keep
+	default:
+		practiceOp(m, r, op, msg)
 	}
 }
 
@@ -919,6 +960,55 @@ func finish(r *room) {
 
 func expected(ra, rb float64) float64 { return 1 / (1 + math.Pow(10, (rb-ra)/400)) }
 
+// rate: rank points and win/loss record after a decided match (mu held). bet: a match with a bet is worth more.
+// Returns the change for a (p1) and b (p2). Used by the line's fight and by the side fights (practice.go).
+func rate(a, b *member, winner int, bet bool) (int, int) {
+	d1, d2 := 0, 0
+	ra, rb := 1000+float64(a.rp), 1000+float64(b.rp)
+	ea := expected(ra, rb)
+	eb := 1 - ea
+	k := func(x *member) float64 {
+		kk := 24.0
+		if x.wins+x.losses < 5 {
+			kk *= 2 // new players move fast to their real rank
+		}
+		if bet {
+			kk *= 1.25 // a bet match is worth more
+		}
+		return kk
+	}
+	sa, sb := 0.0, 0.0
+	if winner == 1 {
+		sa = 1
+		a.wins++
+		b.losses++
+	} else {
+		sb = 1
+		b.wins++
+		a.losses++
+	}
+	d1 = int(math.Round(k(a) * (sa - ea)))
+	d2 = int(math.Round(k(b) * (sb - eb)))
+	if winner == 1 {
+		if d1 < 1 {
+			d1 = 1
+		}
+		if d2 > -1 {
+			d2 = -1
+		}
+	} else {
+		if d2 < 1 {
+			d2 = 1
+		}
+		if d1 > -1 {
+			d1 = -1
+		}
+	}
+	a.rp = clampI(a.rp+d1, 0, 1000000)
+	b.rp = clampI(b.rp+d2, 0, 1000000)
+	return d1, d2
+}
+
 // settle ends the match: rank points, bet, claims, queue rotation (mu held).
 func settle(r *room, winner int, forfeit, void bool, quitter *member) {
 	if r.phase != "play" {
@@ -934,48 +1024,7 @@ func settle(r *room, winner int, forfeit, void bool, quitter *member) {
 		"p1":  a.name, "p2": b.name}
 	d1, d2 := 0, 0
 	if !void && winner != 0 {
-		ra, rb := 1000+float64(a.rp), 1000+float64(b.rp)
-		ea := expected(ra, rb)
-		eb := 1 - ea
-		k := func(x *member) float64 {
-			kk := 24.0
-			if x.wins+x.losses < 5 {
-				kk *= 2 // new players move fast to their real rank
-			}
-			if r.matchBet.Pts > 0 || r.matchBet.Cstake {
-				kk *= 1.25 // a bet match is worth more
-			}
-			return kk
-		}
-		sa, sb := 0.0, 0.0
-		if winner == 1 {
-			sa = 1
-			a.wins++
-			b.losses++
-		} else {
-			sb = 1
-			b.wins++
-			a.losses++
-		}
-		d1 = int(math.Round(k(a) * (sa - ea)))
-		d2 = int(math.Round(k(b) * (sb - eb)))
-		if winner == 1 {
-			if d1 < 1 {
-				d1 = 1
-			}
-			if d2 > -1 {
-				d2 = -1
-			}
-		} else {
-			if d2 < 1 {
-				d2 = 1
-			}
-			if d1 > -1 {
-				d1 = -1
-			}
-		}
-		a.rp = clampI(a.rp+d1, 0, 1000000)
-		b.rp = clampI(b.rp+d2, 0, 1000000)
+		d1, d2 = rate(a, b, winner, r.matchBet.Pts > 0 || r.matchBet.Cstake)
 	}
 	res["rp"] = map[string]int{"p1": d1, "p2": d2}
 	res["newrp"] = map[string]int{"p1": a.rp, "p2": b.rp}
@@ -1096,12 +1145,54 @@ func reaper() {
 	}
 }
 
+// A free Render service falls asleep after 15 minutes without incoming traffic, and falling asleep drops every
+// connection in every room. A room full of people who are only waiting or watching sends almost nothing, so while
+// anybody is in a room the server calls its own public address now and then: that counts as incoming traffic.
+// Render tells the service its own address in RENDER_EXTERNAL_URL; TFG_SELF_URL overrides it. With nobody in a
+// room the server is left to sleep (a sleeping server costs no free hours).
+func pingSelf(cl *http.Client, url string) error {
+	resp, err := cl.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("answered %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func keepAwake(every time.Duration) {
+	base := strings.TrimRight(os.Getenv("TFG_SELF_URL"), "/")
+	if base == "" {
+		base = strings.TrimRight(os.Getenv("RENDER_EXTERNAL_URL"), "/")
+	}
+	if base == "" {
+		log.Printf("keep-awake: this server does not know its public address (set TFG_SELF_URL); the game's own keep-alive messages still count as traffic")
+		return
+	}
+	log.Printf("keep-awake: while anybody is in a room, %s/health is called every %v", base, every)
+	cl := &http.Client{Timeout: 20 * time.Second}
+	for range time.Tick(every) {
+		mu.Lock()
+		busy := len(rooms) > 0
+		mu.Unlock()
+		if !busy {
+			continue
+		}
+		if err := pingSelf(cl, base+"/health"); err != nil {
+			log.Printf("keep-awake: could not call %s/health: %v", base, err)
+		}
+	}
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	go reaper()
+	go keepAwake(selfPingEvery)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", handleWS)
 	mux.HandleFunc("/lobbies", handleList)
